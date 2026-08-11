@@ -16,8 +16,8 @@
             grid-template-columns: 1fr 320px;
             gap: 20px;
             width: 100%;
-            max-width: 1400px;
-            margin: 0 auto;
+            max-width: 1900px;
+            margin: 180px auto 0;
             padding: 20px;
             box-sizing: border-box;
             align-items: start;
@@ -37,11 +37,12 @@
         h1, h2 { margin-top: 0; }
         #svg-wrapper {
             width: 100%;
-            min-height: 720px;
             border-radius: 12px;
             border: 1px solid #ddd;
             background: #fff;
-            display: block;
+            display: flex;
+            align-items: center;
+            justify-content: center;
             overflow: hidden;
         }
         #svg-wrapper svg {
@@ -115,14 +116,24 @@
         #svg-wrapper path.assigned { fill: #3498db !important; }
         #svg-wrapper path:hover:not(.assigned) { fill: #2ecc71 !important; }
 
-        .wilaya-label {
-            font-weight: bold;
-            fill: #fff;
-            paint-order: stroke;
+        .leader-line {
             stroke: #1b1b1b;
+            stroke-width: 6px;
             pointer-events: none;
+        }
+        .leader-dot {
+            fill: #1b1b1b;
+            pointer-events: none;
+        }
+        .leader-text {
+            font-weight: bold;
+            fill: #1b1b1b;
+            font-family: Arial, sans-serif;
+            paint-order: stroke;
+            stroke: #fff;
+            stroke-width: 0.25em;
             text-anchor: middle;
-            dominant-baseline: middle;
+            pointer-events: auto;
         }
     </style>
 </head>
@@ -157,52 +168,135 @@
         const selection = new Map(); // id -> { name, number }
         const svgRoot = svgWrapper.querySelector('svg');
 
+        // The SVG clips anything drawn outside its own viewBox — so labels
+        // placed above/beside wilayas near the map's edges get cut off. Pad
+        // the viewBox with margin on all sides to give them room.
+        if (svgRoot) {
+            const [vx, vy, vw, vh] = svgRoot.getAttribute('viewBox').split(/\s+/).map(Number);
+            const PAD = 900;
+            svgRoot.setAttribute('viewBox', `${vx - PAD} ${vy - PAD} ${vw + PAD * 2} ${vh + PAD * 2}`);
+        }
+
         function getWilayaName(path) {
             return path.dataset.nameLatin || path.dataset.name || path.id;
         }
 
-        function getOrCreateLabelLayer() {
-            // Put labels inside the SAME group the paths live in (which has no
-            // transform of its own) so labels share paths' exact local coordinate
-            // space — no CTM/matrix math needed.
-            let layer = svgRoot.querySelector('#wilaya-labels');
+        // All paths share one uniform transform="translate(dx dy)". Parsing it
+        // lets us convert a path's local getBBox() center into the SVG root's
+        // own (untransformed) coordinate space with plain arithmetic — no CTM
+        // needed — so we can freely connect it to a label placed anywhere else
+        // in that same root space.
+        function parseTranslate(transformStr) {
+            if (!transformStr) return { dx: 0, dy: 0 };
+            const m = transformStr.match(/translate\(\s*(-?[\d.]+)[ ,]+(-?[\d.]+)\s*\)/);
+            return m ? { dx: parseFloat(m[1]), dy: parseFloat(m[2]) } : { dx: 0, dy: 0 };
+        }
+
+        // Leader-line labels: a short line from each assigned wilaya's center
+        // out to a "number - name" text placed just above that same wilaya —
+        // stays close to its own region instead of a distant side list.
+        function getOrCreateAnnotationLayer() {
+            let layer = svgRoot.querySelector('#leader-annotations');
             if (!layer) {
-                const pathsParent = svgRoot.querySelector('path[id]').parentNode;
                 layer = document.createElementNS('http://www.w3.org/2000/svg', 'g');
-                layer.setAttribute('id', 'wilaya-labels');
-                pathsParent.appendChild(layer); // appended last = drawn on top
+                layer.setAttribute('id', 'leader-annotations');
+                svgRoot.appendChild(layer); // top-most layer
             }
             return layer;
         }
 
-        function updateLabel(path, number) {
-            const layer = getOrCreateLabelLayer();
-            const existing = layer.querySelector(`text[data-for="${path.id}"]`);
-            if (existing) existing.remove();
-            if (number === undefined) return;
+        // Custom label positions the user has dragged, kept across redraws.
+        const labelPositions = new Map(); // id -> { x, y }
+        const LABEL_FONT_SIZE = 140; // same size for every wilaya label
 
-            // getBBox() is in the path's own local space, BEFORE its own
-            // transform="translate(...)" is applied. Since the label lives in the
-            // same (untransformed) parent group, copying the path's transform
-            // attribute onto the label keeps both in perfect sync.
-            const bbox = path.getBBox();
-            const cx = bbox.x + bbox.width / 2;
-            const cy = bbox.y + bbox.height / 2;
+        function screenToSvgPoint(evt) {
+            const pt = svgRoot.createSVGPoint();
+            pt.x = evt.clientX;
+            pt.y = evt.clientY;
+            return pt.matrixTransform(svgRoot.getScreenCTM().inverse());
+        }
 
-            const shortSide = Math.min(bbox.width, bbox.height);
-            const fontSize = Math.max(70, Math.min(shortSide * 0.55, 260));
+        function makeLabelDraggable(textEl, lineEl, id, fontSize) {
+            let dragging = false;
+            let offset = { x: 0, y: 0 };
 
-            const text = document.createElementNS('http://www.w3.org/2000/svg', 'text');
-            text.setAttribute('data-for', path.id);
-            text.setAttribute('x', cx);
-            text.setAttribute('y', cy);
-            const pathTransform = path.getAttribute('transform');
-            if (pathTransform) text.setAttribute('transform', pathTransform);
-            text.setAttribute('class', 'wilaya-label');
-            text.style.fontSize = fontSize + 'px';
-            text.style.strokeWidth = (fontSize * 0.18) + 'px';
-            text.textContent = number;
-            layer.appendChild(text);
+            textEl.addEventListener('pointerdown', (e) => {
+                e.stopPropagation();
+                dragging = true;
+                textEl.setPointerCapture(e.pointerId);
+                const p = screenToSvgPoint(e);
+                offset.x = p.x - parseFloat(textEl.getAttribute('x'));
+                offset.y = p.y - parseFloat(textEl.getAttribute('y'));
+            });
+
+            textEl.addEventListener('pointermove', (e) => {
+                if (!dragging) return;
+                const p = screenToSvgPoint(e);
+                const newX = p.x - offset.x;
+                const newY = p.y - offset.y;
+                textEl.setAttribute('x', newX);
+                textEl.setAttribute('y', newY);
+                lineEl.setAttribute('x1', newX);
+                lineEl.setAttribute('y1', newY + fontSize * 0.35);
+                labelPositions.set(id, { x: newX, y: newY });
+            });
+
+            const stopDrag = (e) => {
+                dragging = false;
+                try { textEl.releasePointerCapture(e.pointerId); } catch (err) {}
+            };
+            textEl.addEventListener('pointerup', stopDrag);
+            textEl.addEventListener('pointercancel', stopDrag);
+        }
+
+        function redrawAnnotations() {
+            const layer = getOrCreateAnnotationLayer();
+            layer.innerHTML = '';
+
+            selection.forEach((item, id) => {
+                const path = svgRoot.getElementById(id);
+                if (!path) return;
+
+                const bbox = path.getBBox();
+                const { dx, dy } = parseTranslate(path.getAttribute('transform'));
+                const center = { x: bbox.x + bbox.width / 2 + dx, y: bbox.y + bbox.height / 2 + dy };
+
+                // Same label size for every wilaya, regardless of its footprint.
+                const fontSize = LABEL_FONT_SIZE;
+
+                // Use the user's dragged position if they've moved this label,
+                // otherwise the default: just above the wilaya's own top edge.
+                const custom = labelPositions.get(id);
+                const labelX = custom ? custom.x : center.x;
+                const labelY = custom ? custom.y : (bbox.y + dy) - fontSize * 0.7;
+
+                const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+                line.setAttribute('x1', labelX);
+                line.setAttribute('y1', labelY + fontSize * 0.35);
+                line.setAttribute('x2', center.x);
+                line.setAttribute('y2', center.y);
+                line.setAttribute('class', 'leader-line');
+                layer.appendChild(line);
+
+                const dot = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+                dot.setAttribute('cx', center.x);
+                dot.setAttribute('cy', center.y);
+                dot.setAttribute('r', fontSize * 0.12);
+                dot.setAttribute('class', 'leader-dot');
+                layer.appendChild(dot);
+
+                const text = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+                text.setAttribute('x', labelX);
+                text.setAttribute('y', labelY);
+                text.setAttribute('class', 'leader-text');
+                text.style.fontSize = fontSize + 'px';
+                text.style.cursor = 'move';
+                text.style.touchAction = 'none';
+                text.textContent = `${item.number} - ${item.name}`;
+                layer.appendChild(text);
+
+                makeLabelDraggable(text, line, id, fontSize);
+            });
         }
 
         function renderSelection() {
@@ -236,9 +330,10 @@
 
         function clearAssignment(path) {
             selection.delete(path.id);
+            labelPositions.delete(path.id);
             path.classList.remove('assigned');
             path.removeAttribute('title');
-            updateLabel(path, undefined);
+            redrawAnnotations();
         }
 
         function promptWilayaNumber(path) {
@@ -261,7 +356,7 @@
             selection.set(path.id, { name, number });
             path.classList.add('assigned');
             path.setAttribute('title', `${name}: ${number}`);
-            updateLabel(path, number);
+            redrawAnnotations();
             renderSelection();
         }
 
@@ -286,18 +381,21 @@
                 path.setAttribute('style', `fill:${isAssigned ? ASSIGNED_FILL : DEFAULT_FILL};stroke:#333;stroke-width:2px;`);
             });
 
-            // Labels are already real <text> nodes inside svgRoot (added by updateLabel)
-            // with their own per-wilaya font-size/stroke-width already set inline —
-            // just add the remaining export-safe styling, without clobbering those.
-            clone.querySelectorAll('.wilaya-label').forEach(label => {
-                label.removeAttribute('class');
-                label.style.fill = '#fff';
-                label.style.fontWeight = 'bold';
-                label.style.fontFamily = 'Arial, sans-serif';
-                label.style.paintOrder = 'stroke';
-                label.style.stroke = '#1b1b1b';
-                label.style.textAnchor = 'middle';
-                label.style.dominantBaseline = 'middle';
+            // Leader-line annotations (line, dot, text) are real SVG elements
+            // already inside svgRoot (added by redrawAnnotations) — give them
+            // export-safe inline styles equivalent to the page's CSS classes.
+            clone.querySelectorAll('.leader-line').forEach(line => {
+                line.removeAttribute('class');
+                line.setAttribute('style', 'stroke:#1b1b1b;stroke-width:6px;');
+            });
+            clone.querySelectorAll('.leader-dot').forEach(dot => {
+                dot.removeAttribute('class');
+                dot.setAttribute('style', 'fill:#1b1b1b;');
+            });
+            clone.querySelectorAll('.leader-text').forEach(text => {
+                text.removeAttribute('class');
+                const existingFontSize = text.style.fontSize;
+                text.setAttribute('style', `font-weight:bold;fill:#1b1b1b;font-family:Arial,sans-serif;paint-order:stroke;stroke:#fff;stroke-width:0.25em;text-anchor:middle;font-size:${existingFontSize};`);
             });
 
             const viewBox = clone.getAttribute('viewBox').split(/\s+/).map(Number);
